@@ -1,0 +1,89 @@
+#!/usr/bin/bash
+set -Eeuo pipefail
+
+[ "$(id -u)" -eq 0 ] || { printf 'ERRO: esta ação exige root.\n' >&2; exit 1; }
+
+RULE_DIR=/etc/polkit-1/rules.d
+RULE="$RULE_DIR/50-central-fedorento-printer-admin.rules"
+STATE_DIR=/var/lib/central-fedorento
+DISABLED="$STATE_DIR/printer-admin-disabled"
+MARKER='// Managed by Central Fedorento: local printer administration v1'
+
+rule_is_ours() {
+  [ -f "$RULE" ] && grep -Fqx "$MARKER" "$RULE"
+}
+
+install_rule() {
+  if [ -e "$RULE" ] && ! rule_is_ours; then
+    printf 'ERRO: %s já existe e não pertence à Central; não será sobrescrito.\n' "$RULE" >&2
+    exit 2
+  fi
+  install -d -o root -g root -m 0755 "$RULE_DIR"
+  local tmp
+  tmp="$(mktemp "$RULE_DIR/.central-fedorento-printer-admin.XXXXXX")"
+  trap 'rm -f -- "$tmp"' EXIT
+  cat >"$tmp" <<'POLICY'
+// Managed by Central Fedorento: local printer administration v1
+polkit.addRule(function(action, subject) {
+    var printerActions = [
+        "org.opensuse.cupspkhelper.mechanism.all-edit",
+        "org.opensuse.cupspkhelper.mechanism.class-edit",
+        "org.opensuse.cupspkhelper.mechanism.devices-get",
+        "org.opensuse.cupspkhelper.mechanism.printer-enable",
+        "org.opensuse.cupspkhelper.mechanism.printer-local-edit",
+        "org.opensuse.cupspkhelper.mechanism.printer-remote-edit",
+        "org.opensuse.cupspkhelper.mechanism.printer-set-default",
+        "org.opensuse.cupspkhelper.mechanism.printeraddremove"
+    ];
+    if (subject.local && subject.active && printerActions.indexOf(action.id) !== -1) {
+        return polkit.Result.YES;
+    }
+});
+POLICY
+  chmod 0644 "$tmp"
+  chown root:root "$tmp"
+  mv -f -- "$tmp" "$RULE"
+  trap - EXIT
+}
+
+case "${1:-}" in
+  default)
+    if [ -e "$DISABLED" ]; then
+      printf 'A configuração atual mantém a administração de impressoras protegida por autenticação.\n'
+      exit 0
+    fi
+    install_rule
+    printf 'Administração local de filas CUPS sem senha habilitada para sessões locais ativas.\n'
+    ;;
+  enable)
+    install_rule
+    rm -f -- "$DISABLED"
+    printf 'Administração local de filas CUPS sem senha habilitada para sessões locais ativas.\n'
+    ;;
+  disable)
+    if [ -e "$RULE" ] && ! rule_is_ours; then
+      printf 'ERRO: a regra existente não pertence à Central e não será removida.\n' >&2
+      exit 2
+    fi
+    rm -f -- "$RULE"
+    install -d -o root -g root -m 0700 "$STATE_DIR"
+    install -o root -g root -m 0600 /dev/null "$DISABLED"
+    printf 'Regra da Central removida; a política padrão de autenticação do Fedora volta a valer.\n'
+    ;;
+  uninstall)
+    if rule_is_ours; then rm -f -- "$RULE"; fi
+    rm -f -- "$DISABLED"
+    printf 'Regra polkit da Central removida.\n'
+    ;;
+  status)
+    if rule_is_ours && [ ! -e "$DISABLED" ]; then
+      printf 'enabled\n'
+    else
+      printf 'disabled\n'
+    fi
+    ;;
+  *)
+    printf 'Uso: %s {default|enable|disable|uninstall|status}\n' "$0" >&2
+    exit 2
+    ;;
+esac

@@ -1,0 +1,6 @@
+#!/bin/sh
+if [ "$(id -u)" -eq 0 ]; then
+  echo "Central Fedorento deve ser aberta pelo usuário normal; as ações administrativas pedirão a senha quando necessário." >&2
+  exit 1
+fi
+exec /usr/bin/python3 /usr/share/central-fedorento/central_fedorento.py "$@"

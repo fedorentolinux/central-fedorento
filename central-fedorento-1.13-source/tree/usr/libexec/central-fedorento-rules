@@ -1,0 +1,391 @@
+#!/usr/bin/bash
+set -Eeuo pipefail
+
+[ "$(id -u)" -eq 0 ] || { printf 'ERRO: este gerenciador requer root.\n' >&2; exit 1; }
+
+STATE_DIR=/var/lib/central-fedorento
+SMB_MAIN=/etc/samba/smb.conf
+SMB_DIR=/etc/samba/smb.conf.d
+GLOBAL_CONF="$SMB_DIR/central-fedorento-global.conf"
+USERS_CONF="$SMB_DIR/central-fedorento-publico-users.conf"
+INCLUDE_PATH="$GLOBAL_CONF"
+ACL_RULE='/home/[^/]+/Público(/.*)?'
+
+install_pkgs() {
+    local package
+    local -a missing=()
+    for package in "$@"; do
+        rpm -q "$package" >/dev/null 2>&1 || missing+=("$package")
+    done
+    if [ "${#missing[@]}" -gt 0 ]; then
+        dnf install -y "${missing[@]}"
+    fi
+}
+mark_initialized() {
+    install -d -m 0755 "$STATE_DIR"
+    touch "$STATE_DIR/rules-initialized"
+    chmod 0644 "$STATE_DIR/rules-initialized"
+}
+
+cups_enable() {
+    install_pkgs cups cups-client
+    if systemctl cat cups.socket >/dev/null 2>&1; then
+        systemctl enable --now cups.socket
+        systemctl start cups.service || true
+    else
+        systemctl enable --now cups.service
+    fi
+    mark_initialized
+    printf 'Impressão CUPS ativada. A autorização padrão do polkit foi mantida; nenhuma regra permissiva foi criada.\n'
+}
+
+cups_disable() {
+    for unit in cups.path cups.socket cups.service; do
+        systemctl disable --now "$unit" >/dev/null 2>&1 || true
+    done
+    mark_initialized
+    printf 'Impressão CUPS desativada. Filas e configurações de impressora foram preservadas.\n'
+}
+
+insert_samba_include() {
+    python3 - "$SMB_MAIN" "$INCLUDE_PATH" <<'PY'
+from pathlib import Path
+import re
+import sys
+
+main = Path(sys.argv[1])
+include = sys.argv[2]
+text = main.read_text(encoding='utf-8') if main.exists() else '[global]\n'
+if not re.search(r'(?im)^\s*\[global\]\s*$', text):
+    text = '[global]\n' + text
+sections = list(re.finditer(r'(?im)^\s*\[([^\]\r\n]+)\]\s*$', text))
+global_section = next(m for m in sections if m.group(1).strip().lower() == 'global')
+next_section = next((m for m in sections if m.start() > global_section.start()), None)
+end = next_section.start() if next_section else len(text)
+block = text[global_section.end():end]
+pattern = re.compile(r'(?im)^\s*include\s*=\s*' + re.escape(include) + r'\s*$')
+if not pattern.search(block):
+    text = text[:global_section.end()] + block.rstrip() + f'\n    include = {include}\n' + text[end:]
+main.write_text(text, encoding='utf-8')
+PY
+}
+
+remove_samba_includes() {
+    [ -f "$SMB_MAIN" ] || return 0
+    python3 - "$SMB_MAIN" "$INCLUDE_PATH" <<'PY'
+from pathlib import Path
+import re
+import sys
+
+main = Path(sys.argv[1])
+include = sys.argv[2]
+text = main.read_text(encoding='utf-8')
+text = re.sub(r'(?im)^\s*include\s*=\s*' + re.escape(include) + r'\s*\n?', '', text)
+for old in (
+    '/etc/samba/smb.conf.d/central-fedorento-publico.conf',
+    '/etc/samba/smb.conf.d/central-fedorento-guest.conf',
+    '/etc/samba/smb.conf.d/fedorento-publico-users.conf',
+    '/etc/samba/smb.conf.d/fedorento-publico.conf',
+):
+    text = re.sub(r'(?im)^\s*include\s*=\s*' + re.escape(old) + r'\s*\n?', '', text)
+main.write_text(text, encoding='utf-8')
+PY
+}
+
+firewall_enable_for_samba() {
+    systemctl enable --now firewalld.service
+    local zone service state_file tmp legacy_share
+    legacy_share="${1:-0}"
+    zone="$(firewall-cmd --get-active-zones | awk 'NF {print $1; exit}')"
+    if [ -z "$zone" ]; then
+        printf 'Aviso: não foi identificada zona de firewall ativa; o compartilhamento está configurado, mas as regras de Samba/mDNS não foram abertas.\n'
+        return 0
+    fi
+    install -d -m 0755 "$STATE_DIR"
+    state_file="$STATE_DIR/samba-firewall-state"
+    [ ! -e "$state_file" ] || return 0
+    tmp="$(mktemp)"
+    printf '%s\n' "$zone" > "$tmp"
+    for service in samba mdns; do
+        if ! firewall-cmd --permanent --zone="$zone" --query-service="$service" >/dev/null 2>&1; then
+            firewall-cmd --permanent --zone="$zone" --add-service="$service"
+            printf '%s\n' "$service" >> "$tmp"
+        elif [ "$service" = samba ] && [ "$legacy_share" = 1 ]; then
+            # A regra aberta pelo antigo compartilhamento Publico passa a ser controlada pelo toggle.
+            printf '%s\n' "$service" >> "$tmp"
+        fi
+    done
+    install -m 0600 "$tmp" "$state_file"
+    rm -f "$tmp"
+    firewall-cmd --reload
+}
+
+firewall_disable_samba() {
+    local state_file zone service failed keep_samba
+    keep_samba="${1:-0}"
+    state_file="$STATE_DIR/samba-firewall-state"
+    [ -f "$state_file" ] || return 0
+    zone="$(head -n 1 "$state_file")"
+    failed=0
+    while IFS= read -r service; do
+        [ -n "$service" ] || continue
+        if [ "$service" = samba ] && [ "$keep_samba" = 1 ]; then
+            continue
+        fi
+        if ! firewall-cmd --permanent --zone="$zone" --remove-service="$service" >/dev/null 2>&1; then
+            failed=1
+        fi
+    done < <(tail -n +2 "$state_file")
+    if [ "$failed" -eq 0 ]; then
+        if systemctl is-active --quiet firewalld.service; then
+        firewall-cmd --reload || true
+        fi
+        rm -f "$state_file"
+    else
+        printf 'Aviso: não consegui remover todas as regras de firewall; o estado foi mantido para permitir nova tentativa.\n' >&2
+    fi
+}
+
+firewall_adopt_legacy_samba() {
+    local zone state_file tmp
+    command -v firewall-cmd >/dev/null 2>&1 || return 0
+    state_file="$STATE_DIR/samba-firewall-state"
+    [ ! -e "$state_file" ] || return 0
+    zone="$(firewall-cmd --get-active-zones 2>/dev/null | awk 'NF {print $1; exit}' || true)"
+    [ -n "$zone" ] || return 0
+    if firewall-cmd --permanent --zone="$zone" --query-service=samba >/dev/null 2>&1; then
+        install -d -m 0755 "$STATE_DIR"
+        tmp="$(mktemp)"
+        printf '%s\nsamba\n' "$zone" > "$tmp"
+        install -m 0600 "$tmp" "$state_file"
+        rm -f "$tmp"
+    fi
+}
+
+capture_samba_service_state() {
+    local legacy_share="$1" state_file tmp unit active enabled
+    state_file="$STATE_DIR/samba-service-state"
+    [ ! -e "$state_file" ] || return 0
+    install -d -m 0755 "$STATE_DIR"
+    tmp="$(mktemp)"
+    for unit in smb.service nmb.service; do
+        active=0
+        enabled=0
+        if [ "$legacy_share" != 1 ]; then
+            systemctl is-active --quiet "$unit" && active=1 || true
+            systemctl is-enabled --quiet "$unit" && enabled=1 || true
+        fi
+        printf '%s %s %s\n' "$unit" "$active" "$enabled" >> "$tmp"
+    done
+    install -m 0600 "$tmp" "$state_file"
+    rm -f "$tmp"
+}
+
+samba_has_other_shares() {
+    local config
+    command -v testparm >/dev/null 2>&1 || return 0
+    config="$(testparm -s 2>/dev/null)" || return 0
+    printf '%s\n' "$config" | awk 'match($0,/^[[:space:]]*\[[^]]+\][[:space:]]*$/) { section=tolower($0); gsub(/^[[:space:]]+|[[:space:]]+$/, "", section); if (section != "[global]") found=1 } END { exit(found ? 0 : 1) }'
+}
+
+restore_samba_service_state() {
+    local keep_samba="$1" state_file unit active enabled
+    state_file="$STATE_DIR/samba-service-state"
+    [ -f "$state_file" ] || return 0
+    if [ "$keep_samba" = 1 ]; then
+        rm -f "$state_file"
+        printf 'Outros compartilhamentos Samba foram detectados; serviços existentes foram preservados.\n'
+        return 0
+    fi
+    while read -r unit active enabled; do
+        [ -n "$unit" ] || continue
+        if [ "$active" = 1 ]; then
+            systemctl start "$unit" >/dev/null 2>&1 || true
+        else
+            systemctl stop "$unit" >/dev/null 2>&1 || true
+        fi
+        if [ "$enabled" = 1 ]; then
+            systemctl enable "$unit" >/dev/null 2>&1 || true
+        else
+            systemctl disable "$unit" >/dev/null 2>&1 || true
+        fi
+    done < "$state_file"
+    rm -f "$state_file"
+}
+
+samba_enable() {
+    local legacy_share=0
+    install_pkgs samba samba-client samba-common-tools acl policycoreutils-python-utils firewalld
+    install -d -m 0755 "$SMB_DIR"
+    install -d -m 0755 "$STATE_DIR"
+    if [ ! -e "$SMB_MAIN" ]; then
+        printf '[global]\n' > "$SMB_MAIN"
+        chmod 0644 "$SMB_MAIN"
+    fi
+
+    if [ -e "$USERS_CONF" ] || [ -e "$SMB_DIR/central-fedorento-publico.conf" ] || [ -e "$SMB_DIR/central-fedorento-guest.conf" ] || \
+       [ -e "$SMB_DIR/fedorento-publico-users.conf" ] || [ -e "$SMB_DIR/fedorento-publico.conf" ] || \
+       [ -e /etc/systemd/system/fedorento-publico-sync.path ] || [ -x /usr/local/sbin/fedorento-publico-sync ]; then
+        legacy_share=1
+    fi
+    capture_samba_service_state "$legacy_share"
+    # Migra o monitor criado pelo pós-instalação para que só exista um sincronizador ativo.
+    systemctl disable --now fedorento-publico-sync.path >/dev/null 2>&1 || true
+    rm -f /etc/systemd/system/fedorento-publico-sync.path /etc/systemd/system/fedorento-publico-sync.service /usr/local/sbin/fedorento-publico-sync
+    systemctl daemon-reload
+
+    # Remove configurações antigas da Central/pós-instalação, preservando os arquivos dos usuários.
+    remove_samba_includes
+    rm -f "$SMB_DIR/central-fedorento-publico.conf" "$SMB_DIR/central-fedorento-guest.conf" \
+        "$SMB_DIR/fedorento-publico-users.conf" "$SMB_DIR/fedorento-publico.conf"
+    cat > "$GLOBAL_CONF" <<EOF
+map to guest = Bad User
+include = $USERS_CONF
+EOF
+    chmod 0644 "$GLOBAL_CONF"
+    insert_samba_include
+
+    # Migra a regra de contexto antiga, criada pela versão que usava ~/Publico.
+    if [ -f "$STATE_DIR/samba-fcontext-added" ]; then
+        semanage fcontext -d '/home/[^/]+/Publico(/.*)?' >/dev/null 2>&1 || true
+    fi
+    if semanage fcontext -a -t samba_share_t "$ACL_RULE"; then
+        touch "$STATE_DIR/samba-fcontext-added"
+    else
+        semanage fcontext -m -t samba_share_t "$ACL_RULE"
+    fi
+    systemctl daemon-reload
+    /usr/libexec/central-fedorento-publico-sync
+    testparm -s >/dev/null
+    systemctl enable --now central-fedorento-publico-sync.path
+    systemctl enable --now smb.service
+    systemctl enable --now nmb.service || true
+    firewall_enable_for_samba "$legacy_share"
+    mark_initialized
+    printf 'Compartilhamento Samba ativado: cada conta pessoal em /home usa ~/Público, sem senha na zona de rede ativa. O nome de rede Publico-usuário foi mantido para compatibilidade.\n'
+}
+
+samba_disable() {
+    local legacy_share=0 keep_samba=0
+    if [ -e "$USERS_CONF" ] || [ -e "$SMB_DIR/central-fedorento-publico.conf" ] || [ -e "$SMB_DIR/central-fedorento-guest.conf" ] || \
+       [ -e "$SMB_DIR/fedorento-publico-users.conf" ] || [ -e "$SMB_DIR/fedorento-publico.conf" ] || \
+       [ -e /etc/systemd/system/fedorento-publico-sync.path ] || [ -x /usr/local/sbin/fedorento-publico-sync ]; then
+        legacy_share=1
+    fi
+    if [ "$legacy_share" = 1 ]; then
+        firewall_adopt_legacy_samba
+        capture_samba_service_state 1
+    fi
+    systemctl disable --now central-fedorento-publico-sync.path >/dev/null 2>&1 || true
+    systemctl disable --now fedorento-publico-sync.path >/dev/null 2>&1 || true
+    rm -f /etc/systemd/system/fedorento-publico-sync.path /etc/systemd/system/fedorento-publico-sync.service /usr/local/sbin/fedorento-publico-sync
+    remove_samba_includes
+    rm -f "$GLOBAL_CONF" "$USERS_CONF" "$SMB_DIR/central-fedorento-publico.conf" "$SMB_DIR/central-fedorento-guest.conf" \
+        "$SMB_DIR/fedorento-publico-users.conf" "$SMB_DIR/fedorento-publico.conf"
+    if [ -f "$STATE_DIR/samba-fcontext-added" ]; then
+        semanage fcontext -d "$ACL_RULE" >/dev/null 2>&1 || true
+        semanage fcontext -d '/home/[^/]+/Publico(/.*)?' >/dev/null 2>&1 || true
+        rm -f "$STATE_DIR/samba-fcontext-added"
+    fi
+    python3 - <<'PY'
+import json
+import os
+import pwd
+import stat
+import subprocess
+from pathlib import Path
+
+backup_dir = Path('/var/lib/central-fedorento/publico-acl-backups')
+if backup_dir.exists():
+    for backup in backup_dir.glob('*.json'):
+        try:
+            saved = json.loads(backup.read_text(encoding='utf-8'))
+            home = saved['home']
+            if not os.path.isdir(home) or os.path.realpath(home) != home:
+                continue
+            public = os.path.join(home, 'Público')
+            items = saved.get('items', {})
+            if os.path.isdir(public) and not os.path.islink(public):
+                current = []
+                for root, dirs, files in os.walk(public, followlinks=False):
+                    current.extend([root] + [os.path.join(root, name) for name in dirs + files])
+                for item in sorted(set(current), key=lambda p: p.count(os.sep), reverse=True):
+                    if os.path.islink(item):
+                        continue
+                    rel = os.path.relpath(item, public)
+                    original = items.get(rel)
+                    is_dir = os.path.isdir(item)
+                    if original and original.get('created_by_central'):
+                        uid, gid, mode = saved['uid'], saved['gid'], 0o700
+                    elif original:
+                        uid, gid, mode = original['uid'], original['gid'], original['mode']
+                    else:
+                        uid, gid = saved['uid'], saved['gid']
+                        mode = 0o700 if is_dir else 0o600 | (stat.S_IMODE(os.stat(item, follow_symlinks=False).st_mode) & 0o111)
+                    os.chown(item, int(uid), int(gid), follow_symlinks=False)
+                    os.chmod(item, int(mode), follow_symlinks=False)
+            if saved.get('home_acl_user') is None:
+                subprocess.run(['setfacl', '-x', 'u:nobody', home], check=False)
+            else:
+                subprocess.run(['setfacl', '-m', f"u:nobody:{saved['home_acl_user']}", home], check=False)
+            if saved.get('home_acl_mask') is not None:
+                subprocess.run(['setfacl', '-m', f"m:{saved['home_acl_mask']}", home], check=False)
+            elif saved.get('home_acl_user') is None:
+                acl = subprocess.run(['getfacl', '-cp', home], capture_output=True, text=True, check=False).stdout
+                named = any((line.startswith('user:') and line.split(':', 2)[1]) or (line.startswith('group:') and line.split(':', 2)[1]) for line in acl.splitlines())
+                if not named:
+                    subprocess.run(['setfacl', '-x', 'm', home], check=False)
+            if os.path.isdir(public) and not os.path.islink(public):
+                subprocess.run(['restorecon', '-RF', public], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            backup.unlink(missing_ok=True)
+        except (OSError, KeyError, ValueError):
+            continue
+try:
+    backup_dir.rmdir()
+except OSError:
+    pass
+PY
+    if samba_has_other_shares; then
+        keep_samba=1
+    fi
+    firewall_disable_samba "$keep_samba"
+    restore_samba_service_state "$keep_samba"
+    systemctl daemon-reload
+    if systemctl is-active --quiet smb.service; then
+        systemctl try-reload-or-restart smb.service || true
+    fi
+    mark_initialized
+    printf 'Compartilhamentos da pasta Público da Central desativados. Pastas e arquivos foram preservados; outros compartilhamentos não foram removidos.\n'
+}
+
+case "${1:-}" in
+    cups-enable)
+        [ "$#" -eq 1 ] || { printf 'Uso inválido para cups-enable.\n' >&2; exit 2; }
+        cups_enable
+        ;;
+    cups-disable)
+        [ "$#" -eq 1 ] || { printf 'Uso inválido para cups-disable.\n' >&2; exit 2; }
+        cups_disable
+        ;;
+    samba-enable|samba|samba-local|samba-guest)
+        [ "$#" -eq 1 ] || { printf 'Uso inválido para samba-enable.\n' >&2; exit 2; }
+        samba_enable
+        ;;
+    samba-disable)
+        [ "$#" -eq 1 ] || { printf 'Uso inválido para samba-disable.\n' >&2; exit 2; }
+        samba_disable
+        ;;
+    household-defaults)
+        [ "$#" -eq 3 ] || { printf 'Uso: household-defaults CUPS(0|1) SAMBA(0|1).\n' >&2; exit 2; }
+        for value in "$2" "$3"; do
+            case "$value" in 0|1) ;; *) printf 'Valores aceitos: 0 ou 1.\n' >&2; exit 2 ;; esac
+        done
+        if [ "$2" = 1 ]; then cups_enable; else cups_disable; fi
+        if [ "$3" = 1 ]; then samba_enable; else samba_disable; fi
+        mark_initialized
+        ;;
+    *)
+        printf 'ERRO: ação doméstica não autorizada: %s\n' "${1:-vazia}" >&2
+        exit 2
+        ;;
+esac

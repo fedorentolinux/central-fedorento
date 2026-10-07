@@ -1,0 +1,182 @@
+#!/usr/bin/python3
+import json
+import os
+import pwd
+import re
+import stat
+import subprocess
+import tempfile
+import time
+from pathlib import Path
+
+share_conf = Path('/etc/samba/smb.conf.d/central-fedorento-publico-users.conf')
+share_conf.parent.mkdir(parents=True, exist_ok=True)
+backup_dir = Path('/var/lib/central-fedorento/publico-acl-backups')
+backup_dir.mkdir(parents=True, exist_ok=True)
+os.chmod(backup_dir, 0o700)
+
+
+def available_migration_name(parent, name):
+    base, extension = os.path.splitext(name)
+    candidate = f'{base} (migrado de Publico){extension}'
+    index = 2
+    while os.path.lexists(os.path.join(parent, candidate)):
+        candidate = f'{base} (migrado de Publico {index}){extension}'
+        index += 1
+    return candidate
+
+
+def merge_legacy_directory(source, destination):
+    for name in os.listdir(source):
+        old_item = os.path.join(source, name)
+        new_item = os.path.join(destination, name)
+        if not os.path.lexists(new_item):
+            os.replace(old_item, new_item)
+        elif (os.path.isdir(old_item) and not os.path.islink(old_item)
+              and os.path.isdir(new_item) and not os.path.islink(new_item)):
+            merge_legacy_directory(old_item, new_item)
+        else:
+            migrated = available_migration_name(destination, name)
+            os.replace(old_item, os.path.join(destination, migrated))
+    os.rmdir(source)
+
+
+def migrate_legacy_public(home, account_name):
+    old_public = os.path.join(home, 'Publico')
+    public = os.path.join(home, 'Público')
+    if os.path.islink(public):
+        print(f'Pasta Público simbólica ignorada para {account_name}: {public}')
+        return None
+    if os.path.lexists(public) and not os.path.isdir(public):
+        print(f'Pasta Público já existente não é diretório; Publico antigo foi preservado para {account_name}: {public}')
+        return None
+    if not os.path.lexists(old_public):
+        return public
+    if os.path.islink(old_public):
+        print(f'Pasta antiga Publico simbólica ignorada para {account_name}: {old_public}')
+        return public
+    if not os.path.isdir(old_public):
+        print(f'Entrada antiga Publico que não é pasta ignorada para {account_name}: {old_public}')
+        return public
+    if not os.path.lexists(public):
+        os.replace(old_public, public)
+        print(f'Pasta antiga migrada sem cópia: {old_public} -> {public}')
+        return public
+    if not os.path.isdir(public):
+        print(f'Pasta Pública já existente não é diretório; Publico antigo foi preservado: {public}')
+        return None
+    merge_legacy_directory(old_public, public)
+    print(f'Conteúdo de {old_public} foi mesclado em {public}; conflitos foram mantidos com nomes “migrado de Publico”.')
+    return public
+
+
+def backup_state(home, public, account, public_created):
+    backup = backup_dir / f'{account.pw_uid}.json'
+    state = {}
+    if backup.exists():
+        try:
+            state = json.loads(backup.read_text(encoding='utf-8'))
+        except (OSError, ValueError):
+            state = {}
+    if state.get('home') != home:
+        state = {}
+    items = state.setdefault('items', {})
+    for root, dirs, files in os.walk(public, followlinks=False):
+        candidates = [root] + [os.path.join(root, name) for name in dirs + files]
+        for item in candidates:
+            if os.path.islink(item):
+                continue
+            rel = os.path.relpath(item, public)
+            if rel in items:
+                continue
+            info = os.stat(item, follow_symlinks=False)
+            items[rel] = {'uid': info.st_uid, 'gid': info.st_gid, 'mode': stat.S_IMODE(info.st_mode)}
+    if public_created and '.' in items and items['.'].get('created_by_central') is not True:
+        items['.']['created_by_central'] = True
+    if 'home_acl_user' not in state or 'home_acl_mask' not in state:
+        result = subprocess.run(['getfacl', '-cp', home], capture_output=True, text=True, check=True)
+        state['home_acl_user'] = next((line.split(':', 2)[2] for line in result.stdout.splitlines() if line.startswith('user:nobody:')), None)
+        state['home_acl_mask'] = next((line.split(':', 2)[2] for line in result.stdout.splitlines() if line.startswith('mask::')), None)
+    state.update({'home': home, 'uid': account.pw_uid, 'gid': account.pw_gid})
+    fd, tmp_name = tempfile.mkstemp(dir=str(backup_dir), prefix=f'.{account.pw_uid}-')
+    with os.fdopen(fd, 'w', encoding='utf-8') as stream:
+        json.dump(state, stream, sort_keys=True)
+    os.chmod(tmp_name, 0o600)
+    os.replace(tmp_name, backup)
+
+
+# Também migra o modelo para que futuras contas não herdem as duas pastas.
+migrate_legacy_public('/etc/skel', 'modelo de contas')
+if not os.path.islink('/etc/skel/Público'):
+    os.makedirs('/etc/skel/Público', mode=0o755, exist_ok=True)
+
+sections = []
+for account in pwd.getpwall():
+    if account.pw_uid < 1000 or not re.fullmatch(r'[A-Za-z0-9_.-]+', account.pw_name):
+        continue
+    home = os.path.normpath(account.pw_dir)
+    if os.path.realpath(home) != home or not home.startswith('/home/') or '/' in os.path.relpath(home, '/home'):
+        continue
+    # O useradd pode atualizar /etc/passwd antes de terminar de criar a home.
+    for _ in range(15):
+        if os.path.isdir(home):
+            break
+        time.sleep(1)
+    if not os.path.isdir(home) or any(c.isspace() for c in home):
+        continue
+    public = migrate_legacy_public(home, account.pw_name)
+    if public is None:
+        continue
+    if os.path.islink(public):
+        print(f'Pasta Público simbólica ignorada para {account.pw_name}: {public}')
+        continue
+    public_created = not os.path.exists(public)
+    os.makedirs(public, exist_ok=True)
+    backup_state(home, public, account, public_created)
+    os.chown(public, account.pw_uid, account.pw_gid, follow_symlinks=False)
+    os.chmod(public, 0o1777, follow_symlinks=False)
+    subprocess.run(['setfacl', '-m', 'u:nobody:--x', home], check=True)
+    subprocess.run(['restorecon', '-RF', public], check=False)
+    for root, dirs, files in os.walk(public, followlinks=False):
+        for name in dirs + files:
+            item = os.path.join(root, name)
+            if os.path.islink(item):
+                continue
+            mode = stat.S_IMODE(os.stat(item, follow_symlinks=False).st_mode) | 0o666
+            if os.path.isdir(item) or mode & 0o111:
+                mode |= 0o111
+            os.chmod(item, mode, follow_symlinks=False)
+    sections.extend([
+        f'[Publico-{account.pw_name}]',
+        f'    path = {public}',
+        '    browseable = yes',
+        '    read only = no',
+        '    guest ok = yes',
+        '    guest only = yes',
+        '    force user = nobody',
+        '    follow symlinks = no',
+        '    wide links = no',
+        '    create mask = 0666',
+        '    force create mode = 0666',
+        '    directory mask = 0777',
+        '    force directory mode = 0777',
+        '',
+    ])
+
+new_text = '\n'.join(sections) or '# Nenhuma conta pessoal em /home ainda.\n'
+old_text = share_conf.read_text(encoding='utf-8') if share_conf.exists() else None
+if old_text != new_text:
+    fd, tmp_name = tempfile.mkstemp(dir=str(share_conf.parent), prefix='.central-fedorento-publico-')
+    with os.fdopen(fd, 'w', encoding='utf-8') as stream:
+        stream.write(new_text)
+    os.chmod(tmp_name, 0o644)
+    os.replace(tmp_name, share_conf)
+    try:
+        subprocess.run(['testparm', '-s'], stdout=subprocess.DEVNULL, check=True)
+    except Exception:
+        if old_text is None:
+            share_conf.unlink(missing_ok=True)
+        else:
+            share_conf.write_text(old_text, encoding='utf-8')
+        raise
+    subprocess.run(['systemctl', 'try-reload-or-restart', 'smb.service'], check=False)

@@ -1,0 +1,15 @@
+[Desktop Entry]
+Name=Central Fedorento
+Name[pt_BR]=Central Fedorento
+Comment=Central de configuração doméstica do Fedorento
+Comment[pt_BR]=Central de configuração doméstica do Fedorento para usuários leigos
+Exec=central-fedorento
+Icon=central-fedorento
+Terminal=false
+Type=Application
+Categories=System;
+Keywords=configuração;fedorento;fedora;doméstico;controle;samba;rede;impressora;scanner;drivers;
+StartupNotify=true
+StartupWMClass=org.fedorento.CentralFedorento
+X-GNOME-UsesNotifications=true
+X-GNOME-FullName=Central Fedorento — Ferramentas do Sistema

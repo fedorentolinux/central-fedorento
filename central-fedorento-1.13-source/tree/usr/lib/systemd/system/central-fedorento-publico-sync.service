@@ -1,0 +1,6 @@
+[Unit]
+Description=Sincroniza pastas Público e compartilhamentos Samba da Central Fedorento
+
+[Service]
+Type=oneshot
+ExecStart=/usr/libexec/central-fedorento-publico-sync

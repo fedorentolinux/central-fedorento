@@ -1,0 +1,9 @@
+[Unit]
+Description=Detecta contas locais novas para preparar seus compartilhamentos Público
+
+[Path]
+PathChanged=/etc/passwd
+Unit=central-fedorento-publico-sync.service
+
+[Install]
+WantedBy=multi-user.target

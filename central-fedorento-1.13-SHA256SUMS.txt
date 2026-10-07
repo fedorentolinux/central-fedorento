@@ -1,0 +1,5 @@
+0db92ef27632009b8d184ff5f52247eddb458d6451de985847ec7e6eaca48edd  central-fedorento-1.13-1.noarch.rpm
+a8e78a6606a464a6425b40346ae046308a2c7425a12beaa435a821f9311aef9f  fedora_pos_install.sh
+a3cdddcc66d1c1598895ec4f3dcd21493d55382cadff6203bab3e997d3a0c794  central-fedorento-1.13-source.tar.gz
+2e9c91c152d612f666654a6b0c5d25a0d926fe632f283e70d63f80ffc8524660  central-fedorento-1.13-README.md
+76ec49c16938457b381c294a520d63f30dbdc828a10c54b7026dc6c0670f46da  central-fedorento-1.13-AUDITORIA.md

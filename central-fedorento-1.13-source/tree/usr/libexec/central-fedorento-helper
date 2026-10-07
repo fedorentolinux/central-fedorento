@@ -1,0 +1,379 @@
+#!/usr/bin/bash
+set -Eeuo pipefail
+
+fail() { printf 'ERRO: %s\n' "$*" >&2; exit 1; }
+[ "$(id -u)" -eq 0 ] || fail "este helper deve ser executado pelo polkit"
+
+real_uid="${PKEXEC_UID:-}"
+[ -n "$real_uid" ] || fail "não foi possível identificar o usuário da sessão"
+real_user="$(getent passwd "$real_uid" | cut -d: -f1)"
+real_home="$(getent passwd "$real_uid" | cut -d: -f6)"
+[ -n "$real_user" ] && [ -d "$real_home" ] || fail "usuário da sessão inválido"
+real_group="$(id -gn "$real_user")"
+
+# Os controles de impressão e Samba usam um único caminho reversível.
+case "${1:-}" in
+  cups) exec /usr/libexec/central-fedorento-rules cups-enable ;;
+  cups-enable|cups-disable|samba-enable|samba-disable|samba|samba-local|samba-guest|household-defaults)
+    exec /usr/libexec/central-fedorento-rules "$@" ;;
+  printer-policy-enable) exec /usr/libexec/central-fedorento-printer-policy enable ;;
+  printer-policy-disable) exec /usr/libexec/central-fedorento-printer-policy disable ;;
+esac
+
+install_pkgs() {
+  dnf install -y "$@"
+}
+
+# Instalações upstream estão limitadas aos repositórios e argumentos fixos
+# declarados nos casos abaixo; não são aceitos URLs/flags vindos da interface.
+install_theme_repo() (
+  local repo="$1" checkout_name="$2"
+  shift 2
+  local tmp_dir
+  tmp_dir="$(mktemp -d)"
+  trap 'rm -rf "$tmp_dir"' EXIT
+  git clone --depth=1 -- "$repo" "$tmp_dir/$checkout_name"
+  cd "$tmp_dir/$checkout_name"
+  bash ./install.sh "$@"
+)
+
+update_cross_platform() {
+  printf '\n== Atualizando repositórios e pacotes DNF ==\n'
+  dnf makecache --refresh
+  dnf upgrade --refresh -y
+  printf '\n== Atualizando Flatpak ==\n'
+  if command -v flatpak >/dev/null 2>&1; then
+    flatpak update -y || true
+    if [ -S "/run/user/$real_uid/bus" ]; then
+      runuser -u "$real_user" -- env HOME="$real_home" XDG_RUNTIME_DIR="/run/user/$real_uid" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$real_uid/bus" flatpak update --user -y || true
+    else
+      printf 'Sessão D-Bus do usuário não encontrada; Flatpaks do usuário serão atualizados no próximo login.\n'
+    fi
+  else
+    printf 'Flatpak não está instalado; etapa ignorada.\n'
+  fi
+  printf '\n== Atualizando Snap ==\n'
+  if command -v snap >/dev/null 2>&1; then
+    snap refresh || true
+  else
+    printf 'Snapd não está instalado; etapa ignorada.\n'
+  fi
+  printf '\n== Preparando AppImage ==\n'
+  install_pkgs fuse fuse-libs || true
+  install -d -o "$real_user" -g "$real_group" "$real_home/Applications" "$real_home/.local/bin"
+}
+
+case "${1:-}" in
+  maintenance)
+    shift
+    [ "$#" -gt 0 ] || fail 'nenhuma etapa de manutenção foi selecionada'
+    for step in "$@"; do
+      case "$step" in
+        repo) dnf makecache --refresh ;;
+        upgrade) dnf upgrade --refresh -y ;;
+        autoremove) dnf autoremove -y ;;
+        clean) dnf clean all ;;
+        flatpak-unused) command -v flatpak >/dev/null 2>&1 && flatpak uninstall --unused -y || true ;;
+        *) fail "etapa de manutenção não autorizada: $step" ;;
+      esac
+    done
+    printf '\nManutenção selecionada concluída.\n'
+    ;;
+  repo-refresh)
+    dnf makecache --refresh
+    ;;
+  system-update)
+    dnf upgrade --refresh -y
+    ;;
+  full-update)
+    update_cross_platform
+    dnf autoremove -y
+    dnf clean all
+    flatpak uninstall --unused -y 2>/dev/null || true
+    if [ -S "/run/user/$real_uid/bus" ] && command -v flatpak >/dev/null 2>&1; then
+      runuser -u "$real_user" -- env HOME="$real_home" XDG_RUNTIME_DIR="/run/user/$real_uid" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$real_uid/bus" flatpak uninstall --user --unused -y 2>/dev/null || true
+    fi
+    printf '\nManutenção concluída.\n'
+    ;;
+  universal-update)
+    update_cross_platform
+    ;;
+  kernel-cleanup)
+    running="$(uname -r)" || fail "não foi possível identificar o kernel em uso"
+    mapfile -t kernels < <(rpm -q kernel-core --qf '%{VERSION}-%{RELEASE}.%{ARCH}\n' 2>/dev/null | sort -V)
+    [ "${#kernels[@]}" -gt 2 ] || { printf 'Há dois ou menos kernels instalados; nada será removido.\n'; exit 0; }
+    keep_a="${kernels[${#kernels[@]}-1]}"
+    keep_b="${kernels[${#kernels[@]}-2]}"
+    printf 'Kernel em uso: %s\nPreservados: %s e %s\n' "$running" "$keep_a" "$keep_b"
+    for kernel in "${kernels[@]:0:${#kernels[@]}-2}"; do
+      case "$kernel" in
+        *"$running"*) printf 'Preservando kernel em uso: %s\n' "$kernel" ;;
+        *)
+          mapfile -t old_packages < <(rpm -qa --qf '%{NAME} %{VERSION}-%{RELEASE}.%{ARCH}\n' | awk -v target="$kernel" '$2 == target && ($1 == "kernel-core" || $1 == "kernel-modules" || $1 == "kernel-modules-core" || $1 == "kernel-modules-extra") {print $1 "-" $2}')
+          if [ "${#old_packages[@]}" -gt 0 ]; then
+            printf 'Removendo kernel e módulos da versão %s:\n' "$kernel"
+            printf '  %s\n' "${old_packages[@]}"
+            dnf remove -y "${old_packages[@]}"
+          else
+            printf 'Nenhum pacote complementar instalado para %s.\n' "$kernel"
+          fi
+          ;;
+      esac
+    done
+    ;;
+  firewall)
+    install_pkgs firewalld
+    systemctl enable --now firewalld
+    printf 'Firewall ativado sem abrir automaticamente portas de Samba, mDNS ou impressão.\n'
+    ;;
+  firewall-status)
+    install_pkgs firewalld
+    firewall-cmd --state
+    firewall-cmd --list-all
+    ;;
+  printer-config)
+    install_pkgs system-config-printer
+    ;;
+  printer-status)
+    install_pkgs cups-client
+    ;;
+  printer-drivers)
+    install_pkgs cups cups-client cups-filters cups-filters-driverless \
+      foomatic-db-ppds gutenprint-cups hplip hplip-gui \
+      printer-driver-brlaser system-config-printer
+    printf 'Drivers Fedora comuns para HP, Brother, várias Canon/Epson e impressão driverless estão prontos.\n'
+    ;;
+  hplip-plugin)
+    command -v hp-plugin >/dev/null 2>&1 || fail 'hp-plugin não foi encontrado; reinstale hplip-gui pela Central'
+    printf 'Abrindo o instalador oficial HPLIP como administrador. Leia e aceite a licença HP somente se concordar; a instalação é global para as filas compatíveis.\n'
+    exec hp-plugin
+    ;;
+  scanner)
+    install_pkgs sane-backends simple-scan sane-airscan
+    printf 'Suporte a scanner instalado. Conecte o scanner e abra Simple Scan.\n'
+    ;;
+  ipp-usb)
+    install_pkgs ipp-usb
+    printf 'IPP-over-USB instalado sob demanda. Se uma impressora USB clássica parar de responder, desative ipp-usb e use o driver HPLIP/Gutenprint adequado ao modelo.\n'
+    ;;
+  simple-scan)
+    install_pkgs simple-scan sane-backends sane-airscan
+    ;;
+  scanner-tools)
+    install_pkgs sane-backends
+    ;;
+  bluetooth)
+    install_pkgs bluez bluez-obexd
+    systemctl enable --now bluetooth
+    systemctl restart bluetooth
+    ;;
+  fonts)
+    install_pkgs rpm cpio curl cabextract xorg-x11-font-utils fontconfig
+    font_tmp="$(mktemp -d)"
+    trap 'rm -rf -- "$font_tmp"' EXIT
+    font_rpm="$font_tmp/msttcore-fonts-installer-2.6-1.noarch.rpm"
+    font_extract="$font_tmp/extracted"
+    font_dest='/usr/share/fonts/ms-cleartype'
+    font_rpm_url='https://downloads.sourceforge.net/project/mscorefonts2/rpms/msttcore-fonts-installer-2.6-1.noarch.rpm'
+    font_rpm_sha256='55d7f3a86533225634ff3ea2384b4356d9665a29cc7eeacff16602a1714afbb4'
+    mkdir -p "$font_extract"
+    curl -fL --retry 3 --connect-timeout 15 --max-time 120 -o "$font_rpm" "$font_rpm_url"
+    if ! printf '%s  %s\n' "$font_rpm_sha256" "$font_rpm" | sha256sum -c -; then
+      fail 'SHA-256 do RPM não corresponde ao valor publicado no SourceForge; extração cancelada'
+    fi
+    command -v rpm2cpio >/dev/null 2>&1 || fail 'rpm2cpio não foi encontrado'
+    command -v cpio >/dev/null 2>&1 || fail 'cpio não foi encontrado'
+    if ! (cd "$font_extract" && rpm2cpio "$font_rpm" | cpio -id --quiet --no-absolute-filenames); then
+      fail 'não foi possível extrair o conteúdo do RPM de fontes Microsoft'
+    fi
+    font_source="$font_extract/usr/share/fonts/msttcore"
+    [ -d "$font_source" ] || fail 'o RPM não contém o diretório esperado de fontes msttcore'
+    mapfile -d '' font_files < <(find "$font_source" -maxdepth 1 -type f -name '*.ttf' -print0)
+    [ "${#font_files[@]}" -gt 0 ] || fail 'nenhum arquivo TTF foi encontrado no RPM'
+    printf 'Extraindo %s fontes para %s.\n' "${#font_files[@]}" "$font_dest"
+    rm -rf -- "$font_dest"
+    install -d -m 0755 "$font_dest"
+    install -m 0644 "${font_files[@]}" "$font_dest/"
+    fc-cache -fv
+    if ! fc-list | grep -iE 'arial|times|verdana|calibri|comic'; then
+      printf 'Aviso: fc-list não encontrou as famílias de fontes esperadas.\n' >&2
+    fi
+    trap - EXIT
+    rm -rf -- "$font_tmp"
+    printf 'Fontes Microsoft Core copiadas. O RPM não foi instalado e seus scriptlets não foram executados.\n'
+    ;;
+  remaster-tools)
+    [ "$#" -eq 1 ] || fail 'parâmetros inesperados para preparar Crie seu Sistema'
+    [ "$(uname -m)" = 'x86_64' ] || fail 'os RPMs incluídos foram preparados somente para x86_64'
+    fedora_version="$(rpm -E %fedora 2>/dev/null || true)"
+    [ "$fedora_version" = '44' ] || fail 'os RPMs incluídos foram preparados para Fedora 44; use pacotes compatíveis com esta versão do sistema'
+    package_dir='/usr/share/central-fedorento/remaster-packages'
+    gui_rpm="$package_dir/crie-seu-sistema-1.0.0-1.noarch.rpm"
+    eggs_rpm="$package_dir/penguins-eggs-26.9.15-1.x86_64.rpm"
+    [ -f "$gui_rpm" ] && [ -f "$eggs_rpm" ] || fail 'um ou mais RPMs integrados não foram encontrados'
+    gui_sha256='44036bd033cd2be193e8c2b567d183689d3d5c046264e69edd3857ed3ba9d992'
+    eggs_sha256='c4bb3301dea40b4e14d0ac7b5d32210eb677db4ee8bf4a28900f256f25a21541'
+    if ! printf '%s  %s\n' "$gui_sha256" "$gui_rpm" | sha256sum -c -; then
+      fail 'o SHA-256 do pacote Crie seu Sistema não corresponde; instalação cancelada'
+    fi
+    if ! printf '%s  %s\n' "$eggs_sha256" "$eggs_rpm" | sha256sum -c -; then
+      fail 'o SHA-256 do pacote penguins-eggs não corresponde; instalação cancelada'
+    fi
+    gui_nevra="$(rpm -qp --qf '%{NEVRA}' "$gui_rpm" 2>/dev/null)" || fail 'não foi possível ler os metadados do RPM Crie seu Sistema'
+    eggs_nevra="$(rpm -qp --qf '%{NEVRA}' "$eggs_rpm" 2>/dev/null)" || fail 'não foi possível ler os metadados do RPM penguins-eggs'
+    [ "$gui_nevra" = 'crie-seu-sistema-1.0.0-1.noarch' ] || fail 'o primeiro RPM não é a interface Crie seu Sistema esperada'
+    [ "$eggs_nevra" = 'penguins-eggs-26.9.15-1.fc44.x86_64' ] || fail 'o segundo RPM não é o motor Fedora 44 x86_64 esperado'
+    printf 'Os dois arquivos conferem com os SHA-256 integrados. Instalando os aplicativos e dependências pelo DNF; os RPMs fornecidos não têm assinatura digital.\n'
+    dnf install -y "$gui_rpm" "$eggs_rpm"
+    command -v eggs >/dev/null 2>&1 || fail 'penguins-eggs não foi disponibilizado após a instalação'
+    [ -x /usr/bin/crie-seu-sistema ] || fail 'a interface Crie seu Sistema não foi disponibilizada após a instalação'
+    desktop_file='/usr/share/applications/crie-seu-sistema.desktop'
+    if [ -f "$desktop_file" ]; then
+      override_dir='/usr/local/share/applications'
+      [[ ! -L "$override_dir" ]] || fail 'o diretório local de atalhos é um link simbólico; não foi alterado'
+      if [[ ! -d "$override_dir" ]]; then install -d -m 0755 "$override_dir"; fi
+      desktop_source="$desktop_file"
+      if [[ -f "$override_dir/crie-seu-sistema.desktop" ]]; then
+        desktop_source="$override_dir/crie-seu-sistema.desktop"
+      fi
+      desktop_tmp="$(mktemp "$override_dir/.crie-seu-sistema.XXXXXX")"
+      if ! sed '/^NoDisplay=/d; /^\[Desktop Entry\]/a NoDisplay=true' "$desktop_source" > "$desktop_tmp"; then
+        rm -f -- "$desktop_tmp"
+        fail 'não foi possível preparar a ocultação do atalho separado'
+      fi
+      install -m 0644 "$desktop_tmp" "$override_dir/crie-seu-sistema.desktop"
+      rm -f -- "$desktop_tmp"
+      if command -v update-desktop-database >/dev/null 2>&1; then
+        update-desktop-database "$override_dir" >/dev/null 2>&1 || true
+      fi
+    fi
+    printf 'Pacotes preparados. O lançador do menu está oculto pelo override local; a Central abrirá a interface original pelo botão.\n'
+    ;;
+  wine)
+    install_pkgs wine winetricks
+    ;;
+  appimage)
+    install_pkgs fuse fuse-libs || true
+    install_pkgs flatpak
+    install -d -o "$real_user" -g "$real_group" "$real_home/Applications" "$real_home/.local/bin" "$real_home/.local/share/applications"
+    if [ "$(uname -m)" = "x86_64" ]; then
+      flatpak remote-add --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+      flatpak install --system -y flathub io.github.prateekmedia.appimagepool
+      printf 'AppImagePool instalado pelo Flathub para catálogo e busca de AppImages.\n'
+    else
+      printf 'O catálogo AppImagePool do Flathub está empacotado para x86_64; suporte FUSE e pasta Applications foram preparados, mas a loja não foi instalada nesta arquitetura (%s).\n' "$(uname -m)"
+    fi
+    printf 'Suporte preparado em %s/Applications.\n' "$real_home"
+    ;;
+  flatpak)
+    install_pkgs flatpak
+    flatpak remote-add --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+    ;;
+  firmware)
+    install_pkgs fwupd
+    fwupdmgr refresh --force
+    fwupdmgr get-updates
+    ;;
+  dnf-automatic)
+    install_pkgs dnf5-plugin-automatic
+    systemctl enable --now dnf5-automatic.timer
+    ;;
+  cleanup)
+    dnf autoremove -y
+    dnf clean all
+    flatpak uninstall --unused -y 2>/dev/null || true
+    ;;
+  nvidia)
+    if ! install_pkgs akmod-nvidia xorg-x11-drv-nvidia-cuda; then
+      printf 'NVIDIA: os pacotes akmod-nvidia pertencem normalmente ao RPM Fusion. Habilite esse repositório e tente novamente.\n'
+      exit 2
+    fi
+    ;;
+  amd)
+    install_pkgs mesa-va-drivers mesa-vdpau-drivers mesa-dri-drivers
+    ;;
+  intel)
+    install_pkgs intel-media-driver
+    ;;
+  gnome-software)
+    install_pkgs gnome-software
+    ;;
+  pciutils)
+    install_pkgs pciutils
+    ;;
+  disks)
+    install_pkgs gnome-disk-utility
+    ;;
+  gparted)
+    install_pkgs gparted
+    ;;
+  control-center)
+    install_pkgs gnome-control-center
+    ;;
+  control-center-bluetooth)
+    install_pkgs gnome-control-center bluez
+    systemctl enable --now bluetooth || true
+    ;;
+  bluez)
+    install_pkgs bluez
+    ;;
+  pavucontrol)
+    install_pkgs pavucontrol
+    ;;
+  tweaks)
+    install_pkgs gnome-tweaks
+    ;;
+  theme-orchis)
+    install_pkgs git
+    install_theme_repo https://github.com/vinceliuice/Orchis-theme.git Orchis-theme -d /usr/share/themes -t all -c dark -s standard --tweaks black -i fedora
+    ;;
+  theme-colloid-gtk)
+    install_pkgs git
+    install_theme_repo https://github.com/vinceliuice/Colloid-gtk-theme.git Colloid-gtk-theme -d /usr/share/themes -t all -c dark -s standard --tweaks black
+    ;;
+  theme-graphite)
+    install_pkgs git
+    install_theme_repo https://github.com/vinceliuice/Graphite-gtk-theme.git Graphite-gtk-theme -d /usr/share/themes -t all -c dark -s standard --tweaks black
+    ;;
+  theme-whitesur)
+    install_pkgs git
+    install_theme_repo https://github.com/vinceliuice/WhiteSur-gtk-theme.git WhiteSur-gtk-theme -d /usr/share/themes -c Dark -t all --monterey -i fedora
+    ;;
+  theme-yaru)
+    install_pkgs yaru-theme
+    ;;
+  theme-papirus)
+    install_pkgs papirus-icon-theme
+    ;;
+  theme-tela-icons)
+    install_pkgs git
+    install_theme_repo https://github.com/vinceliuice/Tela-icon-theme.git Tela-icon-theme -d /usr/share/icons -a
+    gtk-update-icon-cache -f /usr/share/icons/Tela* 2>/dev/null || true
+    ;;
+  theme-colloid-icons)
+    install_pkgs git
+    install_theme_repo https://github.com/vinceliuice/Colloid-icon-theme.git Colloid-icon-theme -d /usr/share/icons -s all -t all
+    gtk-update-icon-cache -f /usr/share/icons/Colloid* 2>/dev/null || true
+    ;;
+  theme-kora-icons)
+    install_pkgs git
+    tmp_dir="$(mktemp -d)"
+    trap 'rm -rf "$tmp_dir"' EXIT
+    git clone --depth=1 -- https://github.com/bikass/kora.git "$tmp_dir/kora"
+    install -d -m 0755 /usr/share/icons
+    cp -a "$tmp_dir/kora/kora" "$tmp_dir/kora/kora-pgrey" /usr/share/icons/
+    gtk-update-icon-cache -f /usr/share/icons/kora 2>/dev/null || true
+    gtk-update-icon-cache -f /usr/share/icons/kora-pgrey 2>/dev/null || true
+    ;;
+  extensions)
+    install_pkgs gnome-shell-extension-dash-to-dock gnome-shell-extension-appindicator gnome-shell-extension-user-theme
+    ;;
+  extension-manager)
+    install_pkgs flatpak
+    flatpak remote-add --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+    flatpak install --system -y flathub com.mattjakeman.ExtensionManager
+    ;;
+  *)
+    fail "ação não autorizada: ${1:-vazia}"
+    ;;
+esac
